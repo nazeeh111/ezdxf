@@ -1,4 +1,7 @@
 ## Version 1.4.6 - dev
+	- BUGFIX: honor per-layout PSLTSCALE when rendering viewport linetypes
+		- {{issue 1386}}
+		- contributed by #nazeeh111
 	- BUGFIX: Fix JSON export of string values with a backslash or double quote
 		- {{pr 1433}}
 		- contributed by #spicysharkco

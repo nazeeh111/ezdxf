@@ -40,7 +40,7 @@ from .properties import Properties, RenderContext
 from .type_hints import Color
 from .unified_text_renderer import UnifiedTextRenderer
 
-PatternKey: TypeAlias = Tuple[str, float]
+PatternKey: TypeAlias = Tuple[str, float, float]
 DrawEntitiesCallback: TypeAlias = Callable[[RenderContext, Iterable[DXFGraphic]], None]
 
 __all__ = ["AbstractPipeline", "RenderPipeline2d"]
@@ -193,6 +193,7 @@ class RenderPipeline2d(AbstractPipeline):
             pass
         self.clipping_portal = ClippingPortal()
         self.current_vp_scale = 1.0
+        self._vp_ltype_scale = 1.0
         self._current_entity_handle: str = ""
         self._color_mapping: dict[str, str] = dict()
         self._pipeline = self.build_render_pipeline()
@@ -212,10 +213,8 @@ class RenderPipeline2d(AbstractPipeline):
         return clipping_stage
 
     def get_vp_ltype_scale(self) -> float:
-        """The linetype pattern should look the same in all viewports
-        regardless of the viewport scale.
-        """
-        return 1.0 / max(self.current_vp_scale, 0.0001)  # max out at 1:10000
+        """Returns the linetype scale in the transformed paper coordinates."""
+        return self._vp_ltype_scale
 
     def get_backend_properties(self, properties: Properties) -> BackendProperties:
         try:
@@ -281,12 +280,13 @@ class RenderPipeline2d(AbstractPipeline):
     def enter_viewport(self, vp: Viewport) -> bool:
         """Set current viewport, returns ``True`` for valid viewports."""
         self.current_vp_scale = vp.get_scale()
+        self._vp_ltype_scale = 1.0
+        layout = vp.get_layout()
         m = vp.get_transformation_matrix()
         clipping_path = make_path(vp)
         if len(clipping_path):
             vertices = clipping_path.control_vertices()
             if clipping_path.has_curves:
-                layout = vp.get_layout()
                 if isinstance(layout, Layout):
                     # plot paper units:
                     #   0: inches, max sagitta = 1/254 = 0.1 mm
@@ -296,6 +296,10 @@ class RenderPipeline2d(AbstractPipeline):
                     max_sagitta = 1.0 / 254.0 if units == 0 else 0.1
                     vertices = list(clipping_path.flattening(max_sagitta))
             clipping_shape = find_best_clipping_shape(vertices)
+            # Clipping transforms into paper coordinates before linetype rendering.
+            # PSLTSCALE=1 keeps paper dash lengths constant; 0 scales model units.
+            if isinstance(layout, Layout) and not layout.dxf.layout_flags & 1:
+                self._vp_ltype_scale = max(self.current_vp_scale, 0.0001)
             self.clipping_portal.push(clipping_shape, m)
             return True
         return False
@@ -304,6 +308,7 @@ class RenderPipeline2d(AbstractPipeline):
         self.clipping_portal.pop()
         # Reset viewport scaling: viewports cannot be nested!
         self.current_vp_scale = 1.0
+        self._vp_ltype_scale = 1.0
 
     def draw_text(
         self,
@@ -576,24 +581,27 @@ class LinetypeStage2d(RenderStage2d):
 
     def pattern(self, properties: Properties) -> Sequence[float]:
         """Returns simplified linetype tuple: on-off sequence"""
+        ltype_scale = self.get_ltype_scale()
         if self.solid_lines_only:
             scale = 0.0
         else:
-            scale = properties.linetype_scale * self.get_ltype_scale()
+            scale = properties.linetype_scale * ltype_scale
 
-        key: PatternKey = (properties.linetype_name, scale)
+        min_dash_length = self.config.min_dash_length * ltype_scale
+        key: PatternKey = (properties.linetype_name, scale, min_dash_length)
         pattern_ = self.pattern_cache.get(key)
         if pattern_ is None:
-            pattern_ = self._create_pattern(properties, scale)
+            pattern_ = self._create_pattern(properties, scale, min_dash_length)
             self.pattern_cache[key] = pattern_
         return pattern_
 
-    def _create_pattern(self, properties: Properties, scale: float) -> Sequence[float]:
+    def _create_pattern(
+        self, properties: Properties, scale: float, min_dash_length: float
+    ) -> Sequence[float]:
         if len(properties.linetype_pattern) < 2:
             # Do not return None -> None indicates: "not cached"
             return tuple()
 
-        min_dash_length = self.config.min_dash_length * self.get_ltype_scale()
         pattern = [max(e * scale, min_dash_length) for e in properties.linetype_pattern]
         if len(pattern) % 2:
             pattern.pop()
